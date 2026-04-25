@@ -72,37 +72,71 @@ sudo apt install -y git build-essential protobuf-compiler binutils
 ### Steps
 
 ```bash
-mkdir -p ~/repo/kiro-avx2-fix && cd ~/repo/kiro-avx2-fix
+set -e  # stop on error
+
+mkdir -p ~/repo/kiro-avx2-fix
+cd ~/repo/kiro-avx2-fix
 
 # Get LanceDB version bundled with Kiro
 VERSION=$(python3 -c "import json; print(json.load(open('/usr/share/kiro/resources/app/extensions/kiro.kiro-agent/node_modules/@lancedb/vectordb-linux-x64-gnu/package.json'))['version'])")
 echo "LanceDB version: $VERSION"
 
-# Clone and checkout matching tag
-git clone https://github.com/lancedb/lancedb.git
-cd lancedb
-git checkout "tags/v$VERSION"
-
-# Install Node dependencies
-cd node
-npm install
-
-# Patch arrow-arith compilation issue with Rust 1.94+
-ARROW_ARITH=$(find ~/.cargo/registry -path "*/arrow-arith-*/src/temporal.rs" 2>/dev/null | head -1)
-if [ -n "$ARROW_ARITH" ] && grep -q "d\.quarter()" "$ARROW_ARITH"; then
-    sed -i 's/DatePart::Quarter => |d| d.quarter() as i32,/DatePart::Quarter => |d| ChronoDateExt::quarter(\&d) as i32,/' "$ARROW_ARITH"
-    echo "arrow-arith patch applied."
+# Clone repo if needed
+if [ ! -d "lancedb" ]; then
+    git clone https://github.com/lancedb/lancedb.git
 fi
 
-# Compile without AVX2
+cd lancedb
+git fetch --tags
+git checkout "tags/v$VERSION"
+
+# Install Node deps
+cd node
+npm install
+cd ..
+
+# Ensure dependencies are downloaded
+cargo fetch
+
+# ---- FIX arrow-arith (Rust 1.94+ ambiguity) ----
+echo "Patching arrow-arith..."
+
+ARROW_ARITH=$(find ~/.cargo/registry -path "*/arrow-arith-*/src/temporal.rs" 2>/dev/null | head -1)
+
+if [ -z "$ARROW_ARITH" ]; then
+    echo "ERROR: arrow-arith source not found"
+    exit 1
+fi
+
+# Robust patch (handles any formatting)
+sed -i 's/d\.quarter()/ChronoDateExt::quarter(\&d)/g' "$ARROW_ARITH"
+
+echo "Patch applied to $ARROW_ARITH"
+
+# ---- Build without AVX2 ----
+echo "Building..."
+
+cargo clean
 RUSTFLAGS="-C target-cpu=ivybridge" cargo build --release
 
-# Backup original and replace
-LANCEDB_PATH="/usr/share/kiro/resources/app/extensions/kiro.kiro-agent/node_modules/@lancedb/vectordb-linux-x64-gnu/index.node"
-sudo cp "$LANCEDB_PATH" "${LANCEDB_PATH}.bak"
-sudo cp ~/repo/kiro-avx2-fix/lancedb/target/release/liblancedb_node.so "$LANCEDB_PATH"
+OUTPUT_SO="target/release/liblancedb_node.so"
 
-echo "Done. Restart Kiro."
+if [ ! -f "$OUTPUT_SO" ]; then
+    echo "ERROR: Build failed (.so not found)"
+    exit 1
+fi
+
+# ---- Replace binary safely ----
+LANCEDB_PATH="/usr/share/kiro/resources/app/extensions/kiro.kiro-agent/node_modules/@lancedb/vectordb-linux-x64-gnu/index.node"
+
+echo "Backing up original..."
+sudo cp "$LANCEDB_PATH" "${LANCEDB_PATH}.bak"
+
+echo "Replacing binary..."
+sudo cp "$OUTPUT_SO" "$LANCEDB_PATH"
+
+echo ""
+echo "✅ Done. Restart Kiro."
 ```
 
 ---
